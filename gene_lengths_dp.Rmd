@@ -1,0 +1,191 @@
+---
+title: "gene length data prep"
+output: html_document
+date: "2023-11-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## BTECH 610 Project
+
+This script makes a file containing base pair (bp) lengths of all genes found in the feature counts (FC) file produced by Xin, X. et al (2023, https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE236463) using the latest GFF3 file (July 2022) available from the TAIR database complemented by calls Ensembl Plants. This script also tries out four sources for obtaining annotation data and checks their coverage with respect to the genes found in the FC file.  Files obtained from the first two sources were found not to include all gene ids found in the FC file.  Annotation covering all gene ids in the FC file were found in the fourth source.
+
+## Install and load Libraries
+```{r libs, echo=FALSE}
+
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install(version = "3.18")
+# 
+# BiocManager::install("GenomicFeatures")
+# BiocManager::install("TxDb.Athaliana.BioMart.plantsmart28")
+# BiocManager::install("biomaRt")
+
+library(readxl)
+library(magrittr)
+library(dplyr)
+library(GenomicFeatures)
+library(TxDb.Athaliana.BioMart.plantsmart28)
+library(rtracklayer)
+
+```
+
+## Load the FC data
+```{r get data}
+
+setwd("~/Documents/BTECH_610_Project")
+file_path <- "GSE236463_all_rawcount.xlsx"
+dat <- read_excel(file_path)
+
+# making copy of original file
+dat_o <- dat
+
+# remove annotation and aggregates 
+dat <- dat[,c(1,4:15)]
+
+# simplifying column names
+colnames(dat) <- gsub("_1_", '', colnames(dat))
+```
+
+## Initial data check of FC file
+
+A few basic checks of the FC file.  All gene ids are distinct (no genes with multiple records).  As stated in the GEO accession entry, values of counts file appear to be already normalized within each sample.  To confirm, columns sums were compared; each column sums to approximately the same amount.
+```{r FC data check}
+
+ # confirming key on gene id: result = TRUE
+nrow(dat)==length(unique(dat$Gene_id)) 
+
+# As stated in the GEO accession entry, 
+# values of counts file appear to be already normalized within each sample;
+# Each column sums to approximately the same amount.
+sums <- dat %>%
+  summarize(across(where(is.numeric), sum, na.rm = TRUE))
+
+# Calculate the sum of each row for numeric columns
+dat_o$expr_total <- rowSums(dat[sapply(dat, is.numeric)]) 
+
+```
+
+## First source tried: TxDb.Athaliana.BioMart.plantsmart28
+Based on a simple google search ("bioconductor lookup gene lengths") returned this source.
+The FC file contains 4,555 gene ids not included in this source.  The reason is that it is dated.  From the docs:  "This data package was made from resources at BioMart on 2015-10-07 18:17:11 +0000 (Wed, 07 Oct 2015) and based on the ENSEMBL PLANTS 28 (EBI UK)"
+```{r  TxDb}
+
+# accessing annotation data in TxDb object
+txdb <- TxDb.Athaliana.BioMart.plantsmart28
+
+# 'genes' package function pulls out all annotation as GRanges object
+txdb_genes <- genes(txdb)
+
+# convert GRanges to data frame
+txdb_genesDF <- as.data.frame(txdb_genes@ranges)
+rownames(txdb_genesDF) <- txdb_genesDF$names
+
+# counting the number of gene ids found in FC and not in the TxDb source: result = 4,555
+txdb_missing <- length(dat$Gene_id[!dat$Gene_id %in% rownames(txdb_genesDF)])
+print(paste(txdb_missing, "gene ids found in FC file and not in TxDb source."))
+```
+
+## Public release of TAIR GFF3 file
+
+The GFF3 file published on the TAIR website under "public release" is also missing 4,555 genes.
+
+```{r pub release TAIR GFF3}
+
+# Define the URL of the GFF3 file available in the Public Release directory of the TAIR database
+tair10_gff_url <- "http://www.arabidopsis.org/download_files/Genes/TAIR10_genome_release/TAIR10_gff3/TAIR10_GFF3_genes.gff"
+
+# Read the GFF3 file
+tair10_genes <- import.gff3(tair10_gff_url, genome = "TAIR10")
+
+# Extracting Gene IDs from the GRanges object
+gff_gene_ids <- unique(mcols(tair10_genes)$Name)
+
+# Finding Gene IDs in feature counts and not in GFF file
+unmatched_gene_ids0 <- setdiff(dat$Gene_id, gff_gene_ids)
+
+# Count of unmatched Gene IDs  = 4555
+length(unmatched_gene_ids0)
+```
+
+## Latest release of GFF3 file from TAIR
+
+I found another file on the TAIR site with more recent genomic data:
+https://www.arabidopsis.org/download/index-auto.jsp?dir=%2Fdownload_files%2FPublic_Data_Releases%2FTAIR_Data_20220630
+I downloaded  Araport11_GFF3_genes_transposons.Jul2022.gff.gz.  uncompressed it is 302 MB
+From bash I issued the following to pull out a distinct list of genes and lengths:
+
+ awk '$3 == "gene" { 
+         split($9, a, ";"); 
+         split(a[1], b, "="); 
+         gene_id = b[2]; 
+         gene_length = $5 - $4 + 1; 
+         print gene_id, gene_length 
+      }' Araport11_GFF3_genes_transposons.Jul2022.gff | sort | uniq > atgenes.txt
+
+All but 100 gene ids were found in this source.  I inspected a few of the genes in this unmatched set, and they are peer reviewed publications associated with several of them.  So why would they not be in the GFF3 file?
+
+```{r AT Jul 2022}
+
+atgenes_722 <- read.table("atgenes.txt", sep = " ", colClasses = c("character", "integer"), col.names = c("Gene_id", "length"))
+
+# 100 genes in GEO file not found in GFF3 file from TAIR
+unmatched_gene_ids <- setdiff(dat$Gene_id, atgenes_722$Gene_id)
+sum(atgenes_722$length==0)
+write.table(unmatched_gene_ids,"unmatched_genes.txt")
+
+#atgenes_722[grepl("ATMG09980", atgenes_722$Gene_id),] # not found
+
+#gff_gene_ids[grepl("ATMG09980", gff_gene_ids)] # not found
+
+# 52 genes in GEO file with non-zero expression but not found in GFF3 file from TAIR
+unmatched2 <- setdiff(dat_o[dat_o$expr_total>0,"Gene_id"]$Gene_id, atgenes_722$Gene_id)
+
+```
+
+## Use of Ensembl Pants db to lookup remaining gene ids
+
+In the future, Ensembl will be a first choice for gene annotation.  However, in this process I learned of several other useful sources and about the staged data release of a curated genome data.
+
+```{r }
+library(biomaRt)
+
+# si <- sessionInfo()
+# si[] <- lapply(si, function(x) if (is.list(x)) x[sort(names(x))] else sort(x))
+# si
+
+mart <- useMart("plants_mart", dataset = "athaliana_eg_gene", host="https://plants.ensembl.org")
+
+# Function to get gene length
+get_gene_length <- function(gene_id) {
+  result <- getBM(attributes = c('ensembl_gene_id', 'start_position', 'end_position'),
+                  filters = 'ensembl_gene_id',
+                  values = gene_id,
+                  mart = mart)
+  if (nrow(result) == 0) {
+    return(NA)
+  }
+  return(abs(result$start_position - result$end_position))
+}
+
+# Apply the function to all unmatched gene IDs
+lg <- sapply(unmatched_gene_ids, get_gene_length)
+lg <- data.frame(lg)
+lg$Gene_id <- row.names(lg)
+colnames(lg) <- c("length","Gene_id")
+
+all_gene_lengths <- bind_rows(atgenes_722, lg)
+rownames(all_gene_lengths) <- NULL
+write.table(all_gene_lengths, "all_gene_lengths.csv", sep=",", col.names = TRUE, row.names=FALSE)
+
+# Validating gene length df.  Join the data frames on 'Gene_id' a
+dat <- dat %>%
+  left_join(all_gene_lengths, by = "Gene_id")
+
+#  unused strategy: fill in missing values with average
+# dat <- dat %>% mutate(length = ifelse(is.na(length), median(dat$length,na.rm=TRUE), length))
+
+dat[is.na(dat$length),]  # all genes now have a length
+
+```

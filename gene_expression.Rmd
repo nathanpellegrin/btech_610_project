@@ -1,0 +1,603 @@
+---
+title: "lab11_adapt"
+output: html_document
+date: "2023-11-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## BTECH 610 Final Project
+
+
+## Install and load libraries
+
+```{r libs, include=FALSE}
+
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install(version = "3.18")
+# 
+# BiocManager::install("GenomicFeatures")
+# BiocManager::install("limma")
+# BiocManager::install("biomaRt")
+# BiocManager::install("Glimma")
+# BiocManager::install("WGCNA")
+
+library(edgeR)
+library(limma)
+library(Glimma)
+library(gplots)
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(magrittr)
+library(tidyverse)
+library(DESeq2)
+library(plotly)
+library(gt)
+
+```
+
+## Set root, load data, 
+
+```{r get data, include=FALSE}
+
+# set root working directory
+setwd("~/Documents/BTECH_610_Project")
+
+# path to excel data file
+file_path <- "./data/GSE236463_all_rawcount.xlsx"
+
+# read in data
+dat_o <- read_excel(file_path)
+
+# simplify column names
+colnames(dat_o) <- gsub("_1_", '', colnames(dat_o))
+
+# extract only the numeric columns, excluding the notes and the last three columns containing mean feature counts at each treatement level
+dat <- dat[,c(1,4:15)]
+
+# set rownames to reflect gene ids, which is useful when extracting matrices
+#rownames(dat_o) <- dat_o$Gene_id
+
+
+#gl <- read.csv("all_gene_lengths.csv", header=TRUE)
+
+# Join the data frames on 'Gene_id'
+#dat <- dat %>%
+#  left_join(gl, by = "Gene_id")
+
+# confirming all genes have a non-zero length
+#sum(is.na(dat$length))  # result: 0
+
+#sum(dat$length==0)  # result: 0
+
+```
+
+## Filter out genes with zero expression
+```{r}
+
+# add column for total expression
+dat_o <- dat_o %>% mutate(expr_total=rowSums(across(.cols=c(L1,L2,L3,L4,M1,M2,M3,M4,H1,H2,H3,H4))))
+
+# extract data columns containing total expression count and mean at each treatment level and apply log.
+spdat <- dat_o %>% filter(dat_o$expr_total>0) %>% 
+  select(Gene_id,L_1,M_1,H_1,expr_total) %>% 
+  mutate(L_1=log(L_1), M_1=log(M_1), H_1=log(H_1), expr_total=log(expr_total)) %>%
+  mutate(across(everything(), ~ ifelse(. == -Inf, 0, .)))
+
+# pull out summary counts
+filter_smry <- data.frame(table(dat_o$expr_total>0)) %>% mutate(Var1=c("None", "Any"),Pct=Freq/sum(Freq)) %>% rename('Expr Lvl'=Var1)
+
+# print table
+gt(filter_smry)
+```
+
+## Figure 1. Control scatterplot of normalized gene frequencies
+The following 1000 Random points in 3D space visualizes what gene expression data would look like if all genes expressed randomly, independent of experimental variable (three levels of humidity). Compare this to the observed joint distribution of feature counts, below.  The plane shows where points would lie if all genes expression was perfectly correlated across conditions.
+
+```{r control scatter plot}
+# Generate 1000 random points
+set.seed(123)  # Setting a seed for reproducibility
+x <- runif(1000, min=-100, max=100)
+y <- runif(1000, min=-100, max=100)
+z <- runif(1000, min=-100, max=100)
+
+# Create a 3D scatter plot
+plot <- plot_ly() %>%
+    add_markers(x=x, y=y, z=z, type='scatter3d', mode='markers', size=2) %>%
+    add_surface(x=c(-100, 100), y=c(-100, 100), z=matrix(c(-100, -100, 100, 100), ncol=2), showscale=FALSE, opacity=0.2) %>%
+    layout(scene=list(xaxis=list(range=c(-100, 100)),
+                     yaxis=list(range=c(-100, 100)),
+                     zaxis=list(range=c(-100, 100))))
+
+# Render the plot
+plot
+
+```
+
+
+## Figure 2. 3D Scatterplot of mean feature count at each level of humidity
+Axes correspond to experimental conditions (low, medium and high humidity). Each point represents a gene with coordinates determined by log of mean normalized feature counts under each condition. The plane shows where all genes counts are equal.  Compare to control plot. There is a lot of "structure" to the data as the mass is focused in a cone shape in the plane of perfect correlation; there are appear to be other planes passing through the cloud.
+```{r}
+
+fig <- plot_ly(spdat, x = ~L_1, y = ~M_1, z = ~H_1,
+               marker = list(color = ~expr_total, colorscale = c('#FFE1A1', '#BF382A'), showscale = TRUE))
+
+fig <- fig %>% add_markers(size=2, alpha=.1)  %>%
+    add_surface(x=c(-10, 10), y=c(-10, 10), z=matrix(c(-10, -10, 10, 10), ncol=2), showscale=FALSE, opacity=0.2) 
+
+fig <- fig %>% layout(scene = list(xaxis = list(title = 'Low Humidity [log(expr)]'),
+                                   yaxis = list(title = 'Medium Humidity [log(expr)]'),
+                                   zaxis = list(title = 'High Humidity [log(expr)]'))
+)
+
+suppressWarnings(fig)
+
+```
+##  Filter low expression genes in preparation for differential gene expression analysis
+```{r}
+
+# set experimental design matrix
+trt <- factor(c(rep("Low_H",4), rep("Med_H",4), rep("High_H",4)))
+
+mat <- model.matrix(~ trt)
+
+fcm <- as.matrix(dat_o[,4:15])
+
+rownames(fcm) <- dat$Gene_id
+
+# filter low expression genes using CPM method
+fcm_cpm <- cpm(fcm)
+
+# index of row selection
+fcm_filter <- rowSums(fcm_cpm)>1
+
+# show summary table of filtered rows
+fr <- as.data.frame(table(fcm_filter))
+fr <- fr %>% mutate(fcm_filter=c("Drop","Keep"), Pct=Freq/sum(Freq))
+gt(fr)
+
+# extract subset of rows (genes)
+fcm_minimal <- fcm[fcm_filter,] 
+
+# save to file for 
+write.table(fcm_minimal, file="fc_minimal.csv", sep=",", col.names = TRUE, row.names=TRUE)
+
+```
+
+
+```{r}
+###############
+# make MDS plot
+###############
+
+# make diff gene expr object from selected genes
+atc <- DGEList(counts=fcm_minimal)
+
+samples <- colnames(fcm)
+
+sampleInfo <- data.frame(cbind(samples, trt))
+
+col.cell <- c(rep('red', 4),rep('blue', 4),rep('green', 4))
+pch.cell <- c(1,1,1,1,2,2,2,2,3,3,3,3)
+plotMDS(atc, col=col.cell, xlab="Coordinate 1", ylab="Coordinate 2", pch=pch.cell, cex = 1.5, main="Sample treatment multidimensional scaling plot")
+legend("top", xpd = TRUE,
+       # legend = unique(sampleInfo$combine),
+       legend = unique(trt),
+       col = unique(col.cell),
+       pch = unique(pch.cell),
+       cex=0.7,ncol=2)
+```
+
+```{r}
+###############
+# run voom stats
+###############
+
+v <- voom(atc,design=mat,plot=TRUE) 
+
+fit <- lmFit(v, mat) 
+
+fit_log2 <- treat(fit, lfc=log2(2))
+
+tt_log2 <- topTreat(fit_log2, coef = 2, number = dim(fcm_minimal)[1])
+
+tt_log2_p_filter <- tt_log2[tt_log2$adj.P.Val < 0.01,] 
+
+dim(tt_log2_p_filter)
+
+```
+
+```{r}
+###############
+# heatmap
+###############
+
+logcounts <- cpm(atc, log = TRUE)
+
+mypalette <- c("darkblue", 'white', 'red')
+
+morecols <- colorRampPalette(mypalette)
+
+col.cell <- c(rep('red', 4),rep('blue', 4),rep('green', 4))
+
+select_var <- rownames(tt_log2_p_filter)
+
+highly_variable_lcpm <- logcounts[rownames(logcounts) %in% select_var,]
+
+heatmap.2(highly_variable_lcpm,col=morecols(50),trace="none",
+          # heatmap.2(highly_variable_lcpm,col=c("blue", 'white', 'red'),trace="none",
+          main="Differentially expressed genes ",
+          ColSideColors=col.cell, scale="row", cexRow = 0.2,
+          key.title = 'Color key', cexCol = 0.7, offsetCol = 0.01)
+
+```
+
+## Figure 2.
+```{r}
+
+fig5 <- plot_ly(spdat, x = ~L_1, y = ~M_1, z = ~H_1,
+               marker = list(color = ~expr_total, colorscale = c(I("gray"), I("lightgray")), showscale = TRUE))
+
+fig5 <- fig5 %>% add_markers(size=3, opacity=.2)  %>%
+    add_surface(x=c(-10, 10), y=c(-10, 10), z=matrix(c(-10, -10, 10, 10), ncol=2), showscale=FALSE, opacity=0.2) 
+
+fig5 <- fig5 %>% layout(scene = list(xaxis = list(title = 'Low Humidity lg(m(expr))' ),
+                                   yaxis = list(title = 'Medium Humidity lg(m(expr))'),
+                                   zaxis = list(title = 'High Humidity lg(m(expr))' ) ) )
+ 
+
+hdeg <- spdat %>% filter(Gene_id %in% select_var)    
+
+fig5 <- fig5 %>% add_trace(fig5, data=hdeg, x = ~L_1, y = ~M_1, z = ~H_1, type = "scatter3d", mode = "markers", color = I("red"), size=10)
+
+suppressWarnings(fig5)
+
+```
+
+##  Gene Coexpression Analysis
+
+```{r pressure, echo=FALSE}
+
+mdata <- data.frame(fcm_minimal) %>%
+  pivot_longer(
+    cols = where(is.numeric),  # Select all numeric columns
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  mutate(
+    group = substr(name, start = 1, stop = 1)  # Get the shorter treatment names
+  )
+```
+
+```{r}
+
+# ==== Plot groups (Sample Groups vs RNA Seq Counts) to identify outliers
+(
+  p <- mdata %>%
+    ggplot(., aes(x = name, y = value)) +             # x = treatment, y = RNA Seq count
+    geom_violin() +                                   # violin plot, show distribution
+    geom_point(alpha = 0.2) +                         # scatter plot
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 90)          # Rotate treatment text
+    ) +
+    labs(x = "Treatment Groups", y = "RNA Seq Counts") +
+    facet_grid(cols = vars(group), drop = TRUE, scales = "free_x")      # Facet by hour
+)
+
+
+```
+
+```{r}
+
+meta_df <- data.frame( Sample = unlist(dimnames(fcm_minimal)[2])) %>%
+  mutate(
+    Type = substr(Sample, start = 1, stop = 1) 
+  )
+
+dds <- DESeqDataSetFromMatrix(round(fcm_minimal),
+                              meta_df,
+                              design = ~Type)
+#> converting counts to integer mode
+#> Warning in DESeqDataSet(se, design = design, ignoreRank): some variables in
+#> design formula are characters, converting to factors
+
+dds <- DESeq(dds)
+#> estimating size factors
+#> estimating dispersions
+#> gene-wise dispersion estimates
+#> mean-dispersion relationship
+#> final dispersion estimates
+#> fitting model and testing
+vsd <- varianceStabilizingTransformation(dds)
+
+```
+
+
+```{r}
+
+wpn_vsd <- getVarianceStabilizedData(dds)
+rv_wpn <- rowVars(wpn_vsd)
+summary(rv_wpn)
+#>     Min.  1st Qu.   Median     Mean  3rd Qu.     Max.
+#>  0.00000  0.00000  0.00000  0.08044  0.03322 11.14529
+```
+
+```{r}
+q50_wpn <- quantile( rowVars(wpn_vsd), .5)  # <= added to compare results and assess sensitivity of results to inclusion of a greater proportion of genes
+q75_wpn <- quantile( rowVars(wpn_vsd), .75)  # <= original
+q95_wpn <- quantile( rowVars(wpn_vsd), .95)  # <= changed to 95 quantile to reduce dataset
+expr_normalized <- wpn_vsd[ rv_wpn > q75_wpn, ]
+rownames(expr_normalized) <- rownames(fcm_minimal)[rv_wpn > q75_wpn]
+```
+
+```{r}
+
+dim(expr_normalized)
+
+expr_normalized_df <- data.frame(expr_normalized) %>%
+  mutate(
+    Gene_id = row.names(expr_normalized)
+  ) %>%
+  pivot_longer(-Gene_id)
+```
+
+```{r}
+expr_normalized_df %>% ggplot(., aes(x = name, y = value)) +
+#mdata %>% ggplot(., aes(x = name, y = value)) +
+  geom_violin() +
+  geom_point() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text( angle = 90)
+  ) +
+  #ylim(0, NA) +
+  labs(
+    title = "Normalized and 50 quantile Expression",
+    x = "treatment",
+    y = "normalized expression"
+  )
+```
+
+```{r}
+input_mat= t(expr_normalized)
+
+#input_mat[1:5,1:10]           # Look at first 5 rows and 10 columns
+
+library(WGCNA)
+
+allowWGCNAThreads()          # allow multi-threading (optional)
+#> Allowing multi-threading with up to 4 threads.
+
+# Choose a set of soft-thresholding powers
+powers = c(c(1:10), seq(from = 12, to = 20, by = 2))
+
+# Call the network topology analysis function
+sft = pickSoftThreshold(
+  input_mat,             # <= Input data
+  #blockSize = 30,
+  powerVector = powers,
+  verbose = 5
+)
+
+```
+
+```{r}
+
+par(mfrow = c(1,2));
+cex1 = 0.9;
+
+dev.new()
+
+# Your existing plot code
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, signed R^2",
+     main = paste("Scale independence")
+)
+
+# Your existing text code
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = cex1, col = "red"
+)
+
+abline(h = 0.90, col = "red")
+plot(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)",
+     ylab = "Mean Connectivity",
+     type = "n",
+     main = paste("Mean connectivity")
+)
+text(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     labels = powers,
+     cex = cex1, col = "red")
+
+
+
+```
+
+```{r}
+
+picked_power = 9
+temp_cor <- cor       
+cor <- WGCNA::cor         # Force it to use WGCNA cor function (fix a namespace conflict issue)
+netwk <- blockwiseModules(input_mat,                # <= input here
+                          
+                          # == Adjacency Function ==
+                          power = picked_power,                # <= power here
+                          networkType = "signed",
+                          
+                          # == Tree and Block Options ==
+                          deepSplit = 2,
+                          pamRespectsDendro = F,
+                          # detectCutHeight = 0.75,
+                          minModuleSize = 30,
+                          maxBlockSize = 4000,
+                          
+                          # == Module Adjustments ==
+                          reassignThreshold = 0,
+                          mergeCutHeight = 0.25,
+                          
+                          # == TOM == Archive the run results in TOM file (saves time)
+                          saveTOMs = T,
+                          saveTOMFileBase = "ER",
+                          
+                          # == Output Options
+                          numericLabels = T,
+                          verbose = 3)
+
+cor <- temp_cor     # Return cor function to original namespace
+
+# Convert labels to colors for plotting
+mergedColors = labels2colors(netwk$colors)
+
+```
+
+```{r}
+
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(
+  netwk$dendrograms[[1]],
+  mergedColors[netwk$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05 )
+
+
+```
+```{r}
+
+module_df <- data.frame(
+  gene_id = names(netwk$colors),
+  colors = labels2colors(netwk$colors)
+)
+
+#module_df[1:5,]
+
+write_delim(module_df,
+            file = "gene_modules.txt",
+            delim = "\t")
+
+# Get Module Eigengenes per cluster
+MEs0 <- moduleEigengenes(input_mat, mergedColors)$eigengenes
+
+# Reorder modules so similar modules are next to each other
+MEs0 <- orderMEs(MEs0)
+module_order = names(MEs0) %>% gsub("ME","", .)
+
+# Add treatment names
+MEs0$treatment = row.names(MEs0)
+
+# tidy & plot data
+mME = MEs0 %>%
+  pivot_longer(-treatment) %>%
+  mutate(
+    name = gsub("ME", "", name),
+    name = factor(name, levels = module_order)
+  )
+
+```
+
+```{r}
+
+mME %>% ggplot(., aes(x=treatment, y=name, fill=value)) +
+  geom_tile() +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1,1)) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Module-trait Relationships", y = "Modules", fill="corr")
+
+
+```
+
+```{r}
+
+
+# pick out a few modules of interest here
+modules_of_interest = c("green", "turquoise", "grey")
+
+# Pull out list of genes in that module
+submod = module_df %>%
+  subset(colors %in% modules_of_interest)
+
+row.names(module_df) = module_df$gene_id
+
+# Get normalized expression for those genes
+expr_normalized[1:5,1:10]
+
+subexpr = expr_normalized[submod$gene_id,]
+
+submod_df = data.frame(subexpr) %>%
+  mutate(
+    gene_id = row.names(.)
+  ) %>%
+  pivot_longer(-gene_id) %>%
+  mutate(
+    module = module_df[gene_id,]$colors
+  )
+```
+
+```{r}
+submod_df %>% ggplot(., aes(x=name, y=value, group=gene_id)) +
+  geom_line(aes(color = module),
+            alpha = 0.2) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90)
+  ) +
+  facet_grid(rows = vars(module)) +
+  labs(x = "treatment",
+       y = "normalized expression")
+```
+
+```{r}
+
+genes_of_interest = module_df %>%
+  subset(colors %in% modules_of_interest)
+
+expr_of_interest = expr_normalized[genes_of_interest$gene_id,]
+expr_of_interest[1:5,1:5]
+
+TOM = TOMsimilarityFromExpr(t(expr_of_interest),
+                            power = picked_power)
+
+row.names(TOM) = row.names(expr_of_interest)
+colnames(TOM) = row.names(expr_of_interest)
+
+edge_list = data.frame(TOM) %>%
+  mutate(
+    gene1 = row.names(.)
+  ) %>%
+  pivot_longer(-gene1) %>%
+  dplyr::rename(gene2 = name, correlation = value) %>%
+  unique() %>%
+  subset(!(gene1==gene2)) %>%
+  mutate(
+    module1 = module_df[gene1,]$colors,
+    module2 = module_df[gene2,]$colors
+  )
+
+#head(edge_list)
+
+write_delim(edge_list,
+            file = "edgelist.tsv",
+            delim = "\t")
+
+```
+
+

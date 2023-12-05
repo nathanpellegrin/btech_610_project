@@ -1,0 +1,199 @@
+---
+title: "lab11_adapt"
+output: html_document
+date: "2023-11-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## BTECH 610 Project
+
+This script assesses the consequences of repeated normalization of feature counts (FC) obtained from RNA-seq experiments.  This is relevant because in the context of this project the file downloaded from GEO is already normalized across samples and genes while the example scripts I was using to guide my work incorporated different normalization methods, and it is not immediately clear to me if I should use the FC file as-is without applying any other normalization (and modify the example scripts accordingly), or just proceed to input the FC as-is?  More generally, this is an interesting side question given the many options there are for normalizing data, and the possible risk of applying non-idempotent transformations which destroy correlational structure.  My plan here is to test the consequences of applying different normalizations and/or successive normalization methods by comparing the distributions obtained using paired quantile-quantile tests (not sure if that is the correct statistical term for this type of test); the R package WRS2 implements robust non-parametric tests on distributions so this looks like a promising way: https://cran.r-project.org/web/packages/WRS2/index.html
+
+
+
+```{r get data}
+
+library(readxl)
+library(magrittr)
+library(dplyr)
+setwd("~/Documents/BTECH_610_Project")
+file_path <- "GSE236463_all_rawcount.xlsx"
+dat <- read_excel(file_path)
+
+dat_o <- dat
+
+dat <- dat[,c(1,4:15)]
+
+colnames(dat) <- gsub("_1_", '', colnames(dat))
+
+```
+
+## Install and load libraries
+
+```{r libs, echo=FALSE}
+
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install(version = "3.18")
+# 
+# BiocManager::install("GenomicFeatures")
+# BiocManager::install("limma")
+# BiocManager::install("biomaRt")
+# BiocManager::install("Glimma")
+# BiocManager::install("WGCNA")
+
+library(edgeR)
+library(limma)
+library(Glimma)
+library(gplots)
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+
+
+```
+
+```{r}
+
+gl <- read.csv("all_gene_lengths.csv", header=TRUE)
+
+# Join the data frames on 'Gene_id' and fill in missing values with average
+dat <- dat %>%
+  left_join(gl, by = "Gene_id")
+
+# confirming all genes have a length
+sum(is.na(dat$length))  # result: 0
+sum(dat$length==0)  # result: 0
+
+```
+
+```{r}
+
+# set experimental design matrix
+trt <- factor(c(rep("Low_H",4), rep("Med_H",4), rep("High_H",4)))
+mat <- model.matrix(~ trt)
+
+```
+
+
+```{r}
+# Creates a DGEList object 
+x <- DGEList(counts=dat[,-c(1,14)], genes=dat[,c("Gene_id","length")])
+x <- calcNormFactors(x, method="TMM")  ### TMM Normalization
+x_rpkm <- rpkm(x, x$genes$Length)
+table(rowSums(x$counts==0)==12) # 9128 genes were not detected in any experiment
+
+x0 <- DGEList(counts=dat[,-c(1,14)], genes=data.frame(Gene_id=dat$Gene_id, length=rep(100,length(dat$Gene_id))))
+x0 <- calcNormFactors(x0, method="none")  ### TMM Normalization
+x0_rpkm <- rpkm(x0, x0$genes$length)
+
+x1 <- DGEList(counts=dat[,-c(1,14)], genes=dat[,c("Gene_id","length")])
+x1 <- calcNormFactors(x1, method="none")  ### TMM Normalization
+x1_rpkm <- rpkm(x1, x1$genes$Length, normalized.lib.sizes = TRUE)
+
+library(reshape2)
+library(dplyr)
+library(ggplot2)
+
+fco <- melt(dat[,2:13])
+e1 <-ecdf(fco$value)
+fco <- fco %>% mutate(qtile = e1(fco$value))
+fco$rownr <- row.names(fco)
+
+rpkmo <- melt(x_rpkm)
+e2 <- ecdf(rpkmo$value)
+rpkmo <- rpkmo %>% mutate(qtile = e1(rpkmo$value))
+rpkmo$rownr <- row.names(rpkmo)
+
+# Join the two dataframes on the key
+df_joined <- inner_join(fco, rpkmo, by="rownr")
+
+# Q-Q plot
+ggplot(df_joined, aes(x = qtile.x, y = qtile.y)) +
+  geom_point() +
+  labs(x = "Quantiles of FC", y = "Quantiles of RPKM", title = "Q-Q Plot") +
+  theme_minimal()
+```
+
+```{r}
+
+fcm <- as.matrix(dat[,2:13])
+rownames(fcm) <- dat$Gene_id
+
+# filter low expression genes
+# filter for at least 1 CPM
+fcm_cpm <- cpm(fcm)
+fcm_filter <- rowSums(fcm_cpm)>1
+table(fcm_filter)
+fcm_minimal <- fcm[fcm_filter,] 
+
+atc <- DGEList(counts=fcm_minimal)
+
+
+
+```
+
+```{r}
+###############
+# make MDS plot
+###############
+
+samples <- colnames(fcm)
+sampleInfo <- data.frame(cbind(samples, trt))
+
+col.cell <- c(rep('red', 4),rep('blue', 4),rep('green', 4))
+pch.cell <- c(1,1,1,1,2,2,2,2,3,3,3,3)
+plotMDS(atc, col=col.cell, xlab="Coordinate 1", ylab="Coordinate 2", pch=pch.cell, cex = 1.5, main="Sample treatment multidimensional scaling plot")
+legend("top", xpd = TRUE,
+       # legend = unique(sampleInfo$combine),
+       legend = unique(trt),
+       col = unique(col.cell),
+       pch = unique(pch.cell),
+       cex=0.7,ncol=2)
+```
+
+```{r}
+###############
+# run voom stats
+###############
+
+v <- voom(atc,design=mat,plot=TRUE) 
+
+fit <- lmFit(v, mat) 
+
+fit_log2 <- treat(fit, lfc=log2(2))
+
+tt_log2 <- topTreat(fit_log2, coef = 2, number = dim(fcm_minimal)[1])
+
+tt_log2_p_filter <- tt_log2[tt_log2$adj.P.Val < 0.01,] # has 1162 genes
+dim(tt_log2_p_filter)
+#tt_log2_p_filter
+```
+
+```{r}
+###############
+# heatmap
+###############
+
+logcounts <- cpm(atc, log = TRUE)
+mypalette <- c("darkblue", 'white', 'red')
+morecols <- colorRampPalette(mypalette)
+
+col.cell <- c(rep('red', 4),rep('blue', 4),rep('green', 4))
+
+select_var <- rownames(tt_log2_p_filter)
+highly_variable_lcpm <- logcounts[rownames(logcounts) %in% select_var,]
+
+heatmap.2(highly_variable_lcpm,col=morecols(50),trace="none",
+          # heatmap.2(highly_variable_lcpm,col=c("blue", 'white', 'red'),trace="none",
+          main="Differentially expressed genes ",
+          ColSideColors=col.cell, scale="row", cexRow = 0.2,
+          key.title = 'Color key', cexCol = 0.7, offsetCol = 0.01)
+
+```
+
+```{r}
+
+```
