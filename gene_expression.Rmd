@@ -57,22 +57,7 @@ dat_o <- read_excel(file_path)
 colnames(dat_o) <- gsub("_1_", '', colnames(dat_o))
 
 # extract only the numeric columns, excluding the notes and the last three columns containing mean feature counts at each treatement level
-dat <- dat[,c(1,4:15)]
-
-# set rownames to reflect gene ids, which is useful when extracting matrices
-#rownames(dat_o) <- dat_o$Gene_id
-
-
-#gl <- read.csv("all_gene_lengths.csv", header=TRUE)
-
-# Join the data frames on 'Gene_id'
-#dat <- dat %>%
-#  left_join(gl, by = "Gene_id")
-
-# confirming all genes have a non-zero length
-#sum(is.na(dat$length))  # result: 0
-
-#sum(dat$length==0)  # result: 0
+#dat <- dat[,c(1,4:15)]
 
 ```
 
@@ -80,20 +65,21 @@ dat <- dat[,c(1,4:15)]
 ```{r}
 
 # add column for total expression
-dat_o <- dat_o %>% mutate(expr_total=rowSums(across(.cols=c(L1,L2,L3,L4,M1,M2,M3,M4,H1,H2,H3,H4))))
+dat_o <- dat_o %>% mutate(expr_total=rowSums(across(.cols=c(L1,L2,L3,L4,M1,M2,M3,M4,H1,H2,H3,H4))))  %>% filter(dat_o$expr_total>0)
 
 # extract data columns containing total expression count and mean at each treatment level and apply log.
-spdat <- dat_o %>% filter(dat_o$expr_total>0) %>% 
+spdat <- dat_o %>% 
   select(Gene_id,L_1,M_1,H_1,expr_total) %>% 
   mutate(L_1=log(L_1), M_1=log(M_1), H_1=log(H_1), expr_total=log(expr_total)) %>%
   mutate(across(everything(), ~ ifelse(. == -Inf, 0, .)))
 
 # pull out summary counts
-filter_smry <- data.frame(table(dat_o$expr_total>0)) %>% mutate(Var1=c("None", "Any"),Pct=Freq/sum(Freq)) %>% rename('Expr Lvl'=Var1)
+filter_smry <- data.frame(table(dat_o$expr_total>0)) %>% mutate(Var1=c("None", "Any"),Pct=Freq/sum(Freq)) %>% rename('Expr Lvl'=Var1) %>%   bind_rows(summarise(., across(where(is.numeric), sum), across(where(is.character), ~'Total')))
 
 # print table
 gt(filter_smry)
 ```
+
 
 ## Figure 1. Control scatterplot of normalized gene frequencies
 The following 1000 Random points in 3D space visualizes what gene expression data would look like if all genes expressed randomly, independent of experimental variable (three levels of humidity). Compare this to the observed joint distribution of feature counts, below.  The plane shows where points would lie if all genes expression was perfectly correlated across conditions.
@@ -137,23 +123,34 @@ fig <- fig %>% layout(scene = list(xaxis = list(title = 'Low Humidity [log(expr)
 suppressWarnings(fig)
 
 ```
-##  Filter low expression genes in preparation for differential gene expression analysis
+##  Define treatment variable as ordered factor and generate model matrix 
 ```{r}
 
-# set experimental design matrix
-trt <- factor(c(rep("Low_H",4), rep("Med_H",4), rep("High_H",4)))
+# set experimental design matrix with ordered option set to TRUE.
+# specifying ordering of the treatment variable is key here.
+# (compare the model.matrix resulting from setting ordered=TRUE/FALSE)
+#  the upshot, in this case, is to reduce the number of genes identified as highely differentially expressed by almost two-thirds.
+
+trt <- factor(c(rep("Low_H",4), rep("Med_H",4), rep("High_H",4)), ordered=TRUE)
+trt_unordered <- factor(c(rep("Low_H",4), rep("Med_H",4), rep("High_H",4)), ordered=TRUE)
 
 mat <- model.matrix(~ trt)
+mat_unordered <- model.matrix(~ trt_unordered)
+```
 
+
+##  Filter low expression genes in preparation for differential gene expression analysis
+```{r}
 fcm <- as.matrix(dat_o[,4:15])
 
-rownames(fcm) <- dat$Gene_id
+rownames(fcm) <- dat_o$Gene_id
 
-# filter low expression genes using CPM method
+# filter low expression genes using CPM method ...
+#  but this is not needed since the data file has already been normalized using TPM.
 fcm_cpm <- cpm(fcm)
 
-# index of row selection
-fcm_filter <- rowSums(fcm_cpm)>1
+# index of row selection requiring at least 7 samples with cpm > 1
+fcm_filter = rowSums(fcm_cpm > 1) > 6
 
 # show summary table of filtered rows
 fr <- as.data.frame(table(fcm_filter))
@@ -163,12 +160,12 @@ gt(fr)
 # extract subset of rows (genes)
 fcm_minimal <- fcm[fcm_filter,] 
 
-# save to file for 
+# save to file for  ... 
 write.table(fcm_minimal, file="fc_minimal.csv", sep=",", col.names = TRUE, row.names=TRUE)
 
 ```
 
-
+## Multidimensional scaling 
 ```{r}
 ###############
 # make MDS plot
@@ -181,8 +178,8 @@ samples <- colnames(fcm)
 
 sampleInfo <- data.frame(cbind(samples, trt))
 
-col.cell <- c(rep('red', 4),rep('blue', 4),rep('green', 4))
-pch.cell <- c(1,1,1,1,2,2,2,2,3,3,3,3)
+col.cell <- c(rep('red', 4),rep('blue', 4),rep('green4', 4))
+pch.cell <- c(1,1,1,1,2,2,2,2,4,4,4,4)
 plotMDS(atc, col=col.cell, xlab="Coordinate 1", ylab="Coordinate 2", pch=pch.cell, cex = 1.5, main="Sample treatment multidimensional scaling plot")
 legend("top", xpd = TRUE,
        # legend = unique(sampleInfo$combine),
@@ -191,26 +188,33 @@ legend("top", xpd = TRUE,
        pch = unique(pch.cell),
        cex=0.7,ncol=2)
 ```
-
+## Selection of highly differentially expressed genes based on fitting of a linear model for each gene and the empirical Bayes moderated-t p-values relative to a minimum fold-change threshold. 
 ```{r}
 ###############
 # run voom stats
 ###############
 
+# Extract voom object which calculates weights for running linear regression of expression ~ treatment and generate a mean-variance relationship plot
 v <- voom(atc,design=mat,plot=TRUE) 
 
+# Fit a linear model for each gene using the contrast matrix defined above
 fit <- lmFit(v, mat) 
 
+# Obtain Bayesian moderated p-values based on log(2) fold change
 fit_log2 <- treat(fit, lfc=log2(2))
 
+# Extract a table of the top-ranked genes from a linear model fit, including p.values
 tt_log2 <- topTreat(fit_log2, coef = 2, number = dim(fcm_minimal)[1])
 
+# Extract highly differentially expressed genes based on p.value < 0.01
 tt_log2_p_filter <- tt_log2[tt_log2$adj.P.Val < 0.01,] 
 
-dim(tt_log2_p_filter)
+# print the number of differentially expressed genes identified
+gt(data.frame('DE Genes'=nrow(tt_log2_p_filter)))
 
 ```
 
+## Generate heatmap visualization of DE genes
 ```{r}
 ###############
 # heatmap
@@ -229,18 +233,19 @@ select_var <- rownames(tt_log2_p_filter)
 highly_variable_lcpm <- logcounts[rownames(logcounts) %in% select_var,]
 
 heatmap.2(highly_variable_lcpm,col=morecols(50),trace="none",
-          # heatmap.2(highly_variable_lcpm,col=c("blue", 'white', 'red'),trace="none",
+          # heatmap.2(highly_ variable_lcpm,col=c("blue", 'white', 'red'),trace="none",
           main="Differentially expressed genes ",
           ColSideColors=col.cell, scale="row", cexRow = 0.2,
-          key.title = 'Color key', cexCol = 0.7, offsetCol = 0.01)
+          key.title = 'Color key', key.xlab="gene Z Score", key.ylab="log2CPM", cexCol = 0.7, offsetCol = 0.01, revC=FALSE)
+
 
 ```
 
-## Figure 2.
+## Figure N. Visualize DE genes in 3D scatterplot
 ```{r}
 
 fig5 <- plot_ly(spdat, x = ~L_1, y = ~M_1, z = ~H_1,
-               marker = list(color = ~expr_total, colorscale = c(I("gray"), I("lightgray")), showscale = TRUE))
+               marker = list(color = ~expr_total, colorscale = c(I("blue"), I("lightgray")), showscale = TRUE))
 
 fig5 <- fig5 %>% add_markers(size=3, opacity=.2)  %>%
     add_surface(x=c(-10, 10), y=c(-10, 10), z=matrix(c(-10, -10, 10, 10), ncol=2), showscale=FALSE, opacity=0.2) 
@@ -252,13 +257,15 @@ fig5 <- fig5 %>% layout(scene = list(xaxis = list(title = 'Low Humidity lg(m(exp
 
 hdeg <- spdat %>% filter(Gene_id %in% select_var)    
 
-fig5 <- fig5 %>% add_trace(fig5, data=hdeg, x = ~L_1, y = ~M_1, z = ~H_1, type = "scatter3d", mode = "markers", color = I("red"), size=10)
+fig5 <- fig5 %>% add_trace(fig5, data=hdeg, x = ~L_1, y = ~M_1, z = ~H_1, type = "scatter3d", mode = "markers", color = I("red"), size=8)
 
 suppressWarnings(fig5)
 
 ```
 
 ##  Gene Coexpression Analysis
+
+## Reshape data to long format
 
 ```{r pressure, echo=FALSE}
 
@@ -273,6 +280,7 @@ mdata <- data.frame(fcm_minimal) %>%
   )
 ```
 
+## Visualization of distribution of normalized expression counts for each sample
 ```{r}
 
 # ==== Plot groups (Sample Groups vs RNA Seq Counts) to identify outliers
@@ -294,17 +302,17 @@ mdata <- data.frame(fcm_minimal) %>%
 
 ```{r}
 
+#  Extract meta data for feeding to DESeq 
 meta_df <- data.frame( Sample = unlist(dimnames(fcm_minimal)[2])) %>%
   mutate(
-    Type = substr(Sample, start = 1, stop = 1) 
+    Humidity = factor(substr(Sample, start = 1, stop = 1), levels=c("L","M","H"), labels=c("Low","Medium","High")) # ,  ordered=TRUE) ... following functions do not accept ordered factors (instead must pass model.matrix)
   )
 
+#  Create DESeqDataSet object from fcm_minimal (data excluding low expression genes)
 dds <- DESeqDataSetFromMatrix(round(fcm_minimal),
                               meta_df,
-                              design = ~Type)
-#> converting counts to integer mode
-#> Warning in DESeqDataSet(se, design = design, ignoreRank): some variables in
-#> design formula are characters, converting to factors
+                              design = mat) #~Humidity)
+
 
 dds <- DESeq(dds)
 #> estimating size factors
@@ -313,29 +321,34 @@ dds <- DESeq(dds)
 #> mean-dispersion relationship
 #> final dispersion estimates
 #> fitting model and testing
-vsd <- varianceStabilizingTransformation(dds)
+
+
 
 ```
 
-
+## Apply variance stabilizing transformation to data and summarize resulting distribution
 ```{r}
+#  Apply variance stabilizing transformation
+vsd <- varianceStabilizingTransformation(dds)
+# ...this transforms will be okay on top of normalization .. this is for adjusting poisson noise
 
+# 
 wpn_vsd <- getVarianceStabilizedData(dds)
+
 rv_wpn <- rowVars(wpn_vsd)
+
 summary(rv_wpn)
 #>     Min.  1st Qu.   Median     Mean  3rd Qu.     Max.
 #>  0.00000  0.00000  0.00000  0.08044  0.03322 11.14529
 ```
 
+## Filter for genes in upper P percent of genes based on expression
 ```{r}
 q50_wpn <- quantile( rowVars(wpn_vsd), .5)  # <= added to compare results and assess sensitivity of results to inclusion of a greater proportion of genes
 q75_wpn <- quantile( rowVars(wpn_vsd), .75)  # <= original
 q95_wpn <- quantile( rowVars(wpn_vsd), .95)  # <= changed to 95 quantile to reduce dataset
 expr_normalized <- wpn_vsd[ rv_wpn > q75_wpn, ]
 rownames(expr_normalized) <- rownames(fcm_minimal)[rv_wpn > q75_wpn]
-```
-
-```{r}
 
 dim(expr_normalized)
 
@@ -346,6 +359,7 @@ expr_normalized_df <- data.frame(expr_normalized) %>%
   pivot_longer(-Gene_id)
 ```
 
+## Visualize distibution of normalized expression
 ```{r}
 expr_normalized_df %>% ggplot(., aes(x = name, y = value)) +
 #mdata %>% ggplot(., aes(x = name, y = value)) +
@@ -362,7 +376,7 @@ expr_normalized_df %>% ggplot(., aes(x = name, y = value)) +
     y = "normalized expression"
   )
 ```
-
+## Use WGCNA to build coexpression network bsaed on correlated expression patterns across samples
 ```{r}
 input_mat= t(expr_normalized)
 
@@ -385,7 +399,7 @@ sft = pickSoftThreshold(
 )
 
 ```
-
+## Plot mean connectivity of genes in network
 ```{r}
 
 par(mfrow = c(1,2));
@@ -402,12 +416,12 @@ plot(sft$fitIndices[, 1],
 )
 
 # Your existing text code
-text(sft$fitIndices[, 1],
-     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+text(sft$fitIndices[, 1]+.5,
+     -sign(sft$fitIndices[, 3]-.1) * sft$fitIndices[, 2],
      labels = powers, cex = cex1, col = "red"
 )
 
-abline(h = 0.90, col = "red")
+abline(h = 0.87, col = "red")
 plot(sft$fitIndices[, 1],
      sft$fitIndices[, 5],
      xlab = "Soft Threshold (power)",
@@ -424,7 +438,8 @@ text(sft$fitIndices[, 1],
 
 ```
 
-```{r}
+
+```{r, include=FALSE}
 
 picked_power = 9
 temp_cor <- cor       
@@ -461,9 +476,9 @@ mergedColors = labels2colors(netwk$colors)
 
 ```
 
+## Plot the dendrogram and the module colors underneath
 ```{r}
 
-# Plot the dendrogram and the module colors underneath
 plotDendroAndColors(
   netwk$dendrograms[[1]],
   mergedColors[netwk$blockGenes[[1]]],
@@ -473,8 +488,10 @@ plotDendroAndColors(
   addGuide = TRUE,
   guideHang = 0.05 )
 
-
+#  compare to heatmap ...   select a few high signal genes to conduct more detailed analysis.
+#   then look up in GO. .. enrichment analysis
 ```
+## Extract gene modules 
 ```{r}
 
 module_df <- data.frame(
@@ -504,10 +521,14 @@ mME = MEs0 %>%
   mutate(
     name = gsub("ME", "", name),
     name = factor(name, levels = module_order)
-  )
+  ) %>% 
+  mutate(treatment = factor(treatment, levels = c("L1", "L2", "L3", "L4", 
+                                                  "M1", "M2", "M3", "M4", 
+                                                  "H1", "H2", "H3", "H4")))
 
 ```
 
+## Heatmap visualiation of expression level within each module across samples 
 ```{r}
 
 mME %>% ggplot(., aes(x=treatment, y=name, fill=value)) +
@@ -520,16 +541,19 @@ mME %>% ggplot(., aes(x=treatment, y=name, fill=value)) +
     midpoint = 0,
     limit = c(-1,1)) +
   theme(axis.text.x = element_text(angle=90)) +
-  labs(title = "Module-trait Relationships", y = "Modules", fill="corr")
+  labs(title = "Module-trait Relationships", y = "modules", x="humidity level : plant", fill="corr")
 
 
 ```
+The heatmap above shows the characteristic correlational pattern that identifies each module.
 
-```{r}
 
+
+## Pick out a few modules of interest
+```{r, include=FALSE}
 
 # pick out a few modules of interest here
-modules_of_interest = c("green", "turquoise", "grey")
+modules_of_interest = c("brown",  "turquoise", "blue", "yellow")
 
 # Pull out list of genes in that module
 submod = module_df %>%
@@ -548,24 +572,27 @@ submod_df = data.frame(subexpr) %>%
   ) %>%
   pivot_longer(-gene_id) %>%
   mutate(
-    module = module_df[gene_id,]$colors
+    module = module_df[gene_id,]$colors,
+    name = factor(name, levels=c("L1","L2","L3","L4","M1","M2","M3","M4","H1","H2","H3","H4"))
   )
 ```
 
+## Visualization of selected example modules showing correlated gene expression
 ```{r}
 submod_df %>% ggplot(., aes(x=name, y=value, group=gene_id)) +
   geom_line(aes(color = module),
             alpha = 0.2) +
+  scale_color_manual(values = c("blue", "brown",  "turquoise3",  "yellow3")) +
   theme_bw() +
   theme(
     axis.text.x = element_text(angle = 90)
   ) +
   facet_grid(rows = vars(module)) +
-  labs(x = "treatment",
+  labs(x = "humidity level : plant",
        y = "normalized expression")
 ```
-
-```{r}
+## Write out edge list to file
+```{r, include=FALSE}
 
 genes_of_interest = module_df %>%
   subset(colors %in% modules_of_interest)
@@ -600,4 +627,44 @@ write_delim(edge_list,
 
 ```
 
+## Extract eigen-genes and kME
+```{r}
 
+# Calculate module eigengenes
+MEs <- moduleEigengenes(t(expr_of_interest), colors = genes_of_interest$colors)$eigengenes
+
+# Relate module eigengenes to gene expression profiles
+moduleMembership <- as.data.frame(t(cor(MEs, t(expr_of_interest), use = "p")))
+
+mM <- moduleMembership %>% 
+  mutate(Gene_id=rownames(moduleMembership)) %>% 
+  pivot_longer(cols=MEblue:MEyellow, names_to="module") %>% 
+  mutate(module=substring(module,3,100)) 
+
+write.csv(mM,"module_membership.csv")
+
+mM_top <- mM %>% 
+  group_by(module) %>% 
+  slice_max(order_by=value, n=10) %>%
+  select(Gene_id, module)
+
+write.csv(mM_top,"module_top_10_genes.csv")
+
+intersect(mM_top$Gene_id, hdeg$Gene_id)
+}
+```
+
+
+## Comparing the results of DE and GCN
+```{r}
+#  All DE genes are found in GCN
+length(intersect(unique(module_df$gene_id),hdeg$Gene_id)) == length(hdeg$Gene_id)
+
+#  The DE genes within each module
+mhde <- module_df %>% mutate(Gene_id=gene_id) %>% select(Gene_id, colors) %>% group_by(Gene_id, colors) %>% inner_join(hdeg, by="Gene_id")  %>% 
+  mutate(Diff_H_L=H_1-L_1) %>% arrange(Diff_H_L)
+
+gd <- edge_list %>% filter(abs(correlation)>.5) %>% group_by(gene1) %>% summarise(degree=n()) # blue module missing corrs
+
+write.csv(mhde,'high_deg_wmod.csv')
+```
